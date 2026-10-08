@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO="baekmk95/power-dashboard"
-BRANCH="main"
+BRANCH="master"
 
 INSTALL_DIR="${HOME}/.local/bin"
 INSTALL_PATH="${INSTALL_DIR}/power"

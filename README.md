@@ -45,7 +45,7 @@ Both gauges use the same convention:
 ## Quick install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/baekmk95/power-dashboard/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/baekmk95/power-dashboard/master/install.sh | bash
 ```
 
 Then run:
@@ -57,7 +57,7 @@ power
 ## Inspect before installing
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/baekmk95/power-dashboard/main/install.sh
+curl -fsSL https://raw.githubusercontent.com/baekmk95/power-dashboard/master/install.sh
 ```
 
 Or clone manually:
@@ -164,7 +164,7 @@ power --once
 Re-run the installer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/baekmk95/power-dashboard/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/baekmk95/power-dashboard/master/install.sh | bash
 ```
 
 ## Uninstall
