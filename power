@@ -39,6 +39,18 @@ CLAUDE_HISTORY = (
 CLAUDE_CREDENTIALS = HOME / ".claude/.credentials.json"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
+APP_VERSION = "1.1.0"
+
+VERSION_URL = (
+    "https://raw.githubusercontent.com/"
+    "baekmk95/power-dashboard/master/VERSION"
+)
+
+INSTALL_URL = (
+    "https://raw.githubusercontent.com/"
+    "baekmk95/power-dashboard/master/install.sh"
+)
+
 
 # ============================================================
 # UI
@@ -56,6 +68,46 @@ CYAN = "\033[38;5;45m"
 BLOCK = "█"
 EMPTY = "░"
 SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+
+# ============================================================
+# UPDATE CHECK
+# ============================================================
+
+def check_update():
+    """
+    Check the latest version from GitHub.
+
+    Failure is intentionally silent so network issues
+    never prevent POWER from starting.
+    """
+
+    try:
+        request = urllib.request.Request(
+            VERSION_URL,
+            headers={
+                "User-Agent": "power-dashboard",
+                "Cache-Control": "no-cache",
+            },
+        )
+
+        with urllib.request.urlopen(
+            request,
+            timeout=2,
+        ) as response:
+            latest = (
+                response.read()
+                .decode("utf-8")
+                .strip()
+            )
+
+        if latest and latest != APP_VERSION:
+            return latest
+
+    except Exception:
+        pass
+
+    return None
 
 
 # ============================================================
@@ -798,6 +850,8 @@ def draw(once=False):
 
     now = int(time.time())
 
+    latest_version = check_update()
+
     codex, codex_error = fetch_codex()
     claude, claude_error = fetch_claude()
 
@@ -915,6 +969,19 @@ def draw(once=False):
     output.append(
         "  [r] refresh    [q] quit"
     )
+
+    if latest_version:
+        output.append("")
+        output.append(
+            f"  UPDATE AVAILABLE: "
+            f"v{APP_VERSION} -> v{latest_version}"
+        )
+        output.append(
+            "  Run:"
+        )
+        output.append(
+            f"  curl -fsSL {INSTALL_URL} | bash"
+        )
 
     if not once:
         sys.stdout.write(
