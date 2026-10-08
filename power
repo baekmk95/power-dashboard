@@ -1,0 +1,1048 @@
+#!/usr/bin/env python3
+
+import csv
+import json
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import time
+import tty
+import urllib.error
+import urllib.request
+
+from datetime import datetime
+from pathlib import Path
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+REFRESH_SECONDS = 300       # 화면/API 갱신: 5분
+SAMPLE_SECONDS = 600        # history 저장: 10분
+PANEL_WIDTH = 45
+PANEL_GAP = "    "
+
+HOME = Path.home()
+
+# 기존 CODEX POWER history 재사용
+CODEX_HISTORY = HOME / ".local/share/codex-usage/history.csv"
+
+# Claude history
+CLAUDE_HISTORY = (
+    HOME / ".local/share/power-dashboard/claude-history.csv"
+)
+
+CLAUDE_CREDENTIALS = HOME / ".claude/.credentials.json"
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+
+# ============================================================
+# UI
+# ============================================================
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+
+GREEN = "\033[38;5;82m"
+YELLOW = "\033[38;5;220m"
+RED = "\033[38;5;203m"
+CYAN = "\033[38;5;45m"
+
+BLOCK = "█"
+EMPTY = "░"
+SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+
+# ============================================================
+# FETCH - CODEX
+# ============================================================
+
+def fetch_codex():
+    try:
+        result = subprocess.run(
+            ["codexbar", "--provider", "codex"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=True,
+        )
+
+        total = None
+        remaining = None
+        plan = "Unknown"
+
+        for line in result.stdout.splitlines():
+
+            if line.startswith("Cost:"):
+                parts = line.split()
+
+                if len(parts) >= 4:
+                    total = float(
+                        parts[3].replace(",", "")
+                    )
+
+            elif line.startswith("Credits:"):
+                parts = line.split()
+
+                if len(parts) >= 2:
+                    remaining = float(
+                        parts[1].replace(",", "")
+                    )
+
+            elif line.startswith("Plan:"):
+                plan = line.partition(":")[2].strip()
+
+        if (
+            total is None
+            or remaining is None
+            or total <= 0
+        ):
+            raise ValueError("Invalid Codex telemetry")
+
+        return {
+            "remaining": remaining,
+            "total": total,
+            "detail": plan,
+        }, None
+
+    except (
+        OSError,
+        ValueError,
+        subprocess.SubprocessError,
+    ):
+        return None, "CODEX telemetry unavailable"
+
+
+# ============================================================
+# FETCH - CLAUDE
+# ============================================================
+
+def fetch_claude():
+    try:
+        credentials = json.loads(
+            CLAUDE_CREDENTIALS.read_text()
+        )
+
+        token = credentials[
+            "claudeAiOauth"
+        ]["accessToken"]
+
+        request = urllib.request.Request(
+            CLAUDE_USAGE_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "User-Agent": "claude-code",
+            },
+        )
+
+        with urllib.request.urlopen(
+            request,
+            timeout=15,
+        ) as response:
+            data = json.load(response)
+
+        extra = data.get("extra_usage") or {}
+
+        if (
+            extra.get("monthly_limit") is not None
+            and extra.get("used_credits") is not None
+        ):
+            decimal_places = int(
+                extra.get("decimal_places", 2)
+            )
+
+            divisor = 10 ** decimal_places
+
+            total = (
+                float(extra["monthly_limit"])
+                / divisor
+            )
+
+            used = (
+                float(extra["used_credits"])
+                / divisor
+            )
+
+        else:
+            # fallback
+            spend = data["spend"]
+
+            used_data = spend["used"]
+            limit_data = spend["limit"]
+
+            used = (
+                float(used_data["amount_minor"])
+                / (10 ** int(
+                    used_data.get("exponent", 2)
+                ))
+            )
+
+            total = (
+                float(limit_data["amount_minor"])
+                / (10 ** int(
+                    limit_data.get("exponent", 2)
+                ))
+            )
+
+        if total <= 0:
+            raise ValueError("Invalid Claude limit")
+
+        remaining = max(0.0, total - used)
+
+        return {
+            "remaining": remaining,
+            "total": total,
+            "detail": "Enterprise",
+        }, None
+
+    except urllib.error.HTTPError as e:
+        return None, f"Claude API HTTP {e.code}"
+
+    except (
+        OSError,
+        KeyError,
+        TypeError,
+        ValueError,
+        urllib.error.URLError,
+    ):
+        return None, "Claude usage unavailable"
+
+
+# ============================================================
+# HISTORY
+# ============================================================
+
+def load_history(path):
+    rows = []
+
+    if not path.exists():
+        return rows
+
+    try:
+        with path.open(newline="") as file:
+            reader = csv.DictReader(file)
+
+            for row in reader:
+                try:
+                    rows.append({
+                        "timestamp": int(row["timestamp"]),
+                        "remaining": float(row["remaining"]),
+                        "total": float(row["total"]),
+                    })
+                except (
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                ):
+                    continue
+
+    except OSError:
+        pass
+
+    rows.sort(
+        key=lambda row: row["timestamp"]
+    )
+
+    return rows
+
+
+def save_sample(
+    path,
+    rows,
+    now,
+    remaining,
+    total,
+):
+    """
+    10분마다 저장.
+    단, quota reset / credit 증가 / limit 변경은 즉시 저장.
+    """
+
+    should_save = not rows
+
+    if rows:
+        last = rows[-1]
+
+        if (
+            now - last["timestamp"]
+            >= SAMPLE_SECONDS
+        ):
+            should_save = True
+
+        # quota reset / credits replenished
+        if remaining > last["remaining"] + 0.001:
+            should_save = True
+
+        # plan / limit changed
+        if abs(total - last["total"]) > 0.001:
+            should_save = True
+
+    if not should_save:
+        return
+
+    try:
+        path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        new_file = (
+            not path.exists()
+            or path.stat().st_size == 0
+        )
+
+        with path.open(
+            "a",
+            newline="",
+        ) as file:
+
+            writer = csv.writer(file)
+
+            if new_file:
+                writer.writerow([
+                    "timestamp",
+                    "date",
+                    "remaining",
+                    "total",
+                ])
+
+            writer.writerow([
+                now,
+                datetime.fromtimestamp(
+                    now
+                ).strftime("%Y-%m-%d"),
+                remaining,
+                total,
+            ])
+
+    except OSError:
+        pass
+
+
+# ============================================================
+# METRICS
+# ============================================================
+
+def current_cycle(rows):
+    """
+    quota reset 또는 limit 변경 이전 기록은 제외.
+    """
+
+    if not rows:
+        return []
+
+    start = 0
+
+    for index in range(1, len(rows)):
+        previous = rows[index - 1]
+        current = rows[index]
+
+        if (
+            current["remaining"]
+            > previous["remaining"] + 0.001
+            or abs(
+                current["total"]
+                - previous["total"]
+            ) > 0.001
+        ):
+            start = index
+
+    return rows[start:]
+
+
+def calculate_metrics(
+    rows,
+    now,
+    remaining,
+):
+    rows = current_cycle(rows)
+
+    if not rows:
+        return {
+            "today": 0.0,
+            "last_hour": None,
+            "burn": None,
+            "eta": None,
+            "trend": "collecting data...",
+        }
+
+    now_date = datetime.fromtimestamp(
+        now
+    ).date()
+
+    today_rows = [
+        row
+        for row in rows
+        if datetime.fromtimestamp(
+            row["timestamp"]
+        ).date() == now_date
+    ]
+
+    # --------------------------------------------------------
+    # TODAY
+    # --------------------------------------------------------
+
+    if today_rows:
+        today_used = max(
+            0.0,
+            today_rows[0]["remaining"]
+            - remaining,
+        )
+    else:
+        today_used = 0.0
+
+    # --------------------------------------------------------
+    # LAST 1H
+    # --------------------------------------------------------
+
+    hour_cutoff = now - 3600
+
+    before_hour = [
+        row
+        for row in rows
+        if row["timestamp"] <= hour_cutoff
+    ]
+
+    if before_hour:
+        last_hour = max(
+            0.0,
+            before_hour[-1]["remaining"]
+            - remaining,
+        )
+    else:
+        last_hour = None
+
+    # --------------------------------------------------------
+    # BURN RATE
+    # 오늘 평균 시간당 소비량
+    # --------------------------------------------------------
+
+    burn = None
+
+    if today_rows:
+        elapsed = (
+            now - today_rows[0]["timestamp"]
+        )
+
+        if elapsed >= SAMPLE_SECONDS:
+            burn = (
+                today_used
+                / (elapsed / 3600)
+            )
+
+    # --------------------------------------------------------
+    # EST. RANGE
+    # 현재 burn rate 기준 고갈까지 남은 시간
+    # --------------------------------------------------------
+
+    eta = None
+
+    if burn is not None and burn > 0:
+        eta = remaining / burn
+
+    # --------------------------------------------------------
+    # TREND - recent 4h
+    # remaining 감소 = usage 증가
+    # --------------------------------------------------------
+
+    recent = [
+        row["remaining"]
+        for row in rows
+        if row["timestamp"] >= now - 14400
+    ]
+
+    # 현재 실시간 값도 끝에 포함
+    if recent:
+        recent.append(remaining)
+
+    recent = recent[-24:]
+
+    if len(recent) < 2:
+        trend = "collecting data..."
+
+    else:
+        low = min(recent)
+        high = max(recent)
+
+        if high == low:
+            trend = SPARK_CHARS[0] * len(
+                recent
+            )
+
+        else:
+            chars = []
+
+            for value in recent:
+                level = round(
+                    (high - value)
+                    / (high - low)
+                    * 7
+                )
+
+                level = max(
+                    0,
+                    min(7, level),
+                )
+
+                chars.append(
+                    SPARK_CHARS[level]
+                )
+
+            trend = "".join(chars)
+
+    return {
+        "today": today_used,
+        "last_hour": last_hour,
+        "burn": burn,
+        "eta": eta,
+        "trend": trend,
+    }
+
+
+# ============================================================
+# DISPLAY HELPERS
+# ============================================================
+
+def status_from_pct(pct):
+
+    if pct >= 70:
+        return "HIGH ENERGY", GREEN
+
+    if pct >= 30:
+        return "CRUISING", YELLOW
+
+    return "LOW POWER", RED
+
+
+def make_bar(pct):
+    filled = round(
+        max(0, min(100, pct))
+        * 20
+        / 100
+    )
+
+    return (
+        BLOCK * filled
+        + EMPTY * (20 - filled)
+    )
+
+
+def amount(value, kind):
+
+    if value is None:
+        return "--"
+
+    if kind == "codex":
+        return f"{value:.0f} CR"
+
+    return f"${value:.2f}"
+
+
+# ============================================================
+# PANEL
+# ============================================================
+
+def build_panel(
+    title,
+    kind,
+    result,
+    error,
+    history_path,
+    now,
+):
+
+    width = PANEL_WIDTH
+    border = "+" + "-" * (width - 2) + "+"
+
+    lines = []
+
+    def add(
+        text="",
+        color=None,
+        bold=False,
+        dim=False,
+    ):
+        lines.append({
+            "text": str(text)[:width],
+            "color": color,
+            "bold": bold,
+            "dim": dim,
+        })
+
+    add(border, CYAN, bold=True)
+    add(title.center(width), CYAN, bold=True)
+    add(border, CYAN, bold=True)
+    add()
+
+    # --------------------------------------------------------
+    # unavailable
+    # --------------------------------------------------------
+
+    if result is None:
+
+        add(
+            "  DATA UNAVAILABLE",
+            RED,
+            bold=True,
+        )
+
+        add(
+            "  " + (
+                error
+                or "Unknown error"
+            )
+        )
+
+        for _ in range(13):
+            add()
+
+    # --------------------------------------------------------
+    # normal
+    # --------------------------------------------------------
+
+    else:
+
+        remaining = result["remaining"]
+        total = result["total"]
+
+        pct = max(
+            0,
+            min(
+                100,
+                remaining / total * 100,
+            ),
+        )
+
+        status, color = status_from_pct(
+            pct
+        )
+
+        bar = make_bar(pct)
+
+        add(
+            f"  {bar}  {pct:5.1f}% LEFT",
+            color,
+            bold=True,
+        )
+
+        if kind == "codex":
+            add(
+                f"  {remaining:.0f} / "
+                f"{total:.0f} CR remaining"
+            )
+        else:
+            add(
+                f"  ${remaining:.2f} / "
+                f"${total:.2f} remaining"
+            )
+
+        add()
+
+        # Save current sample
+        rows = load_history(history_path)
+
+        save_sample(
+            history_path,
+            rows,
+            now,
+            remaining,
+            total,
+        )
+
+        # reload if new sample was saved
+        rows = load_history(
+            history_path
+        )
+
+        metrics = calculate_metrics(
+            rows,
+            now,
+            remaining,
+        )
+
+        add(
+            "  TODAY        "
+            + f"{amount(
+                metrics['today'],
+                kind
+            ):>12}"
+        )
+
+        add(
+            "  LAST 1H      "
+            + f"{amount(
+                metrics['last_hour'],
+                kind
+            ):>12}"
+        )
+
+        burn_text = amount(
+            metrics["burn"],
+            kind,
+        )
+
+        if burn_text != "--":
+            burn_text += "/h"
+
+        add(
+            "  BURN RATE    "
+            + f"{burn_text:>12}"
+        )
+
+        if metrics["eta"] is None:
+            eta = "--"
+        else:
+            eta = f"{metrics['eta']:.0f}"
+
+        add(
+            "  EST. RANGE   "
+            + f"{eta:>8} hours"
+        )
+
+        add()
+
+        add(
+            "  USAGE TREND - RECENT 4H",
+            dim=True,
+        )
+
+        add(
+            "  " + metrics["trend"],
+            color,
+        )
+
+        add()
+
+        add(
+            f"  STATUS    {status}",
+            color,
+            bold=True,
+        )
+
+        if kind == "codex":
+            add(
+                "  PLAN      "
+                + result["detail"]
+            )
+        else:
+            add(
+                f"  LIMIT     ${total:.2f}"
+            )
+
+        add()
+
+    clock = datetime.fromtimestamp(
+        now
+    ).strftime("%H:%M:%S")
+
+    add(
+        f"  Last update {clock}",
+        dim=True,
+    )
+
+    add(
+        "  Auto refresh every 5 min",
+        dim=True,
+    )
+
+    add()
+
+    add(
+        border,
+        CYAN,
+        bold=True,
+    )
+
+    return lines
+
+
+# ============================================================
+# ANSI RENDER
+# ============================================================
+
+def style(line, enabled=True):
+
+    text = line["text"]
+
+    if not enabled:
+        return text
+
+    prefix = ""
+
+    if line["color"]:
+        prefix += line["color"]
+
+    if line["bold"]:
+        prefix += BOLD
+
+    if line["dim"]:
+        prefix += DIM
+
+    if not prefix:
+        return text
+
+    return prefix + text + RESET
+
+
+# ============================================================
+# DRAW
+# ============================================================
+
+def draw(once=False):
+
+    now = int(time.time())
+
+    codex, codex_error = fetch_codex()
+    claude, claude_error = fetch_claude()
+
+    left = build_panel(
+        "CODEX POWER",
+        "codex",
+        codex,
+        codex_error,
+        CODEX_HISTORY,
+        now,
+    )
+
+    right = build_panel(
+        "CLAUDE POWER",
+        "claude",
+        claude,
+        claude_error,
+        CLAUDE_HISTORY,
+        now,
+    )
+
+    color_enabled = (
+        sys.stdout.isatty()
+        and not once
+    )
+
+    terminal_width = (
+        shutil.get_terminal_size(
+            fallback=(100, 30)
+        ).columns
+    )
+
+    output = []
+
+    required_width = (
+        PANEL_WIDTH * 2
+        + len(PANEL_GAP)
+    )
+
+    # --------------------------------------------------------
+    # SIDE BY SIDE
+    # --------------------------------------------------------
+
+    if terminal_width >= required_width:
+
+        rows = max(
+            len(left),
+            len(right),
+        )
+
+        empty_line = {
+            "text": "",
+            "color": None,
+            "bold": False,
+            "dim": False,
+        }
+
+        for index in range(rows):
+
+            l = (
+                left[index]
+                if index < len(left)
+                else empty_line
+            )
+
+            r = (
+                right[index]
+                if index < len(right)
+                else empty_line
+            )
+
+            left_text = style(
+                l,
+                color_enabled,
+            )
+
+            right_text = style(
+                r,
+                color_enabled,
+            )
+
+            plain_left = l["text"]
+
+            padding = (
+                PANEL_WIDTH
+                - len(plain_left)
+            )
+
+            output.append(
+                left_text
+                + (" " * padding)
+                + PANEL_GAP
+                + right_text
+            )
+
+    # --------------------------------------------------------
+    # STACKED MODE
+    # --------------------------------------------------------
+
+    else:
+
+        for panel in (left, right):
+
+            for line in panel:
+                output.append(
+                    style(
+                        line,
+                        color_enabled,
+                    )
+                )
+
+            output.append("")
+
+    output.append("")
+    output.append(
+        "  [r] refresh    [q] quit"
+    )
+
+    if not once:
+        sys.stdout.write(
+            "\033[H\033[J"
+        )
+
+    print(
+        "\n".join(output),
+        flush=True,
+    )
+
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+def main():
+
+    # diagnostic / non-interactive mode
+    if "--once" in sys.argv:
+        draw(once=True)
+        return
+
+    if (
+        not sys.stdin.isatty()
+        or not sys.stdout.isatty()
+    ):
+        print(
+            "Interactive terminal required.\n"
+            "Use: power --once",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    old_terminal = termios.tcgetattr(
+        sys.stdin
+    )
+
+    def stop(*_):
+        raise KeyboardInterrupt
+
+    signal.signal(
+        signal.SIGTERM,
+        stop,
+    )
+
+    signal.signal(
+        signal.SIGHUP,
+        stop,
+    )
+
+    try:
+        tty.setcbreak(
+            sys.stdin.fileno()
+        )
+
+        # alternate screen + cursor hide
+        sys.stdout.write(
+            "\033[?1049h"
+            "\033[?25l"
+            "\033[?1004l"
+        )
+
+        sys.stdout.flush()
+
+        draw()
+
+        deadline = (
+            time.monotonic()
+            + REFRESH_SECONDS
+        )
+
+        while True:
+
+            timeout = max(
+                0,
+                deadline
+                - time.monotonic(),
+            )
+
+            ready, _, _ = select.select(
+                [sys.stdin],
+                [],
+                [],
+                timeout,
+            )
+
+            if ready:
+
+                key = (
+                    sys.stdin
+                    .read(1)
+                    .lower()
+                )
+
+                if key == "q":
+                    break
+
+                if key != "r":
+                    continue
+
+            draw()
+
+            deadline = (
+                time.monotonic()
+                + REFRESH_SECONDS
+            )
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+
+        termios.tcsetattr(
+            sys.stdin.fileno(),
+            termios.TCSADRAIN,
+            old_terminal,
+        )
+
+        # cursor restore + alternate screen exit
+        sys.stdout.write(
+            "\033[?25h"
+            "\033[?1004l"
+            "\033[?1049l"
+        )
+
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()
